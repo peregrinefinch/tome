@@ -1,0 +1,1226 @@
+//// Read TOML 1.0, the configuration format that tries hard to be obvious.
+////
+//// A document becomes a `Toml` value: a table at the top, holding strings,
+//// numbers, booleans, dates, arrays and more tables. Take it apart with
+//// `match`, or with the helpers at the end of this module.
+////
+//// ```pooka
+//// import tome
+////
+//// main() {
+////   let text = "name = \"night_library\"\n\n[owner]\nname = \"Ada\"\n"
+////   let assert Ok(config) = tome.parse(text)
+////   echo tome.path(config, ["owner", "name"])
+//// }
+//// ```
+////
+//// Tables keep their keys in the order they were written.
+
+// SPDX-License-Identifier: Apache-2.0
+
+module tome
+
+import pooka/bit_array
+import pooka/float
+import pooka/int
+import pooka/list
+import pooka/result
+import pooka/string
+
+/// Any TOML value.
+class Toml {}
+
+/// A string, with its escapes already resolved.
+class TString(value: String) is Toml
+
+/// A whole number, written in decimal, hexadecimal, octal or binary.
+class TInt(value: Int) is Toml
+
+/// A number with a fraction or an exponent.
+class TFloat(value: Float) is Toml
+
+/// `inf`, `+inf` or `-inf`.
+class TInfinity(positive: Bool) is Toml
+
+/// `nan`, the float that is not a number.
+class TNan is Toml {}
+
+/// `true` or `false`.
+class TBool(value: Bool) is Toml
+
+/// A date with a time, with or without an offset, as it was written:
+/// `1979-05-27T07:32:00Z`. A space between the date and the time becomes `T`.
+class TDateTime(value: String) is Toml
+
+/// A date on its own: `1979-05-27`.
+class TDate(value: String) is Toml
+
+/// A time on its own: `07:32:00`.
+class TTime(value: String) is Toml
+
+/// An array. An array of tables, `[[name]]`, is an array whose items are
+/// tables.
+class TArray(items: List(Toml)) is Toml
+
+/// A table, as its entries in the order they were written.
+class TTable(entries: List(#(String, Toml))) is Toml
+
+/// Why a text is not TOML, and the line where the trouble was noticed.
+class TomlError(line: Int, message: String)
+
+/// Read a TOML document. The result is always a `TTable`.
+///
+/// ```pooka
+/// import tome
+///
+/// assert tome.parse("answer = 42") == Ok(tome.TTable([#("answer", tome.TInt(42))]))
+/// assert tome.parse("answer = ") == Error(tome.TomlError(1, "a value is missing"))
+/// ```
+parse(text: String) -> Result(Toml, TomlError) {
+  _parse(bit_array.from_string(text))
+}
+
+/// Read a document from bytes, rejecting invalid UTF-8 before opening a table.
+/// This is useful with file.read_bytes, where decoding has not happened yet.
+///
+/// ```pooka
+/// import tome
+///
+/// assert tome.parse_bytes(<<110, 32, 61, 32, 49>>) == tome.parse("n = 1")
+/// let assert Error(_) = tome.parse_bytes(<<255>>)
+/// ```
+parse_bytes(input: BitArray) -> Result(Toml, TomlError) {
+  match bit_array.to_string(input) {
+    Ok(_) -> _parse(input)
+    Error(_) -> Error(TomlError(1, "a document must be valid UTF-8"))
+  }
+}
+
+// Keep parser failures in their original shape until this public boundary.
+// map_error visits only the error branch, so line counting stays off the happy path.
+_parse(input: BitArray) -> Result(Toml, TomlError) {
+  _read(input)
+  |> result.map_error(fn(problem: _Fail) {
+    TomlError(
+      1 + _newlines(input, 0) - _newlines(problem.rest, 0),
+      problem.message
+    )
+  })
+}
+
+_read(input: BitArray) -> Result(Toml, _Fail) {
+  _validate(input)?
+  let root = _document(input, _table([], 1), [])?
+  Ok(_freeze(root))
+}
+
+/// A sentence for the person who wrote the file.
+///
+/// ```pooka
+/// import tome
+///
+/// assert tome.describe(tome.TomlError(3, "a value is missing")) == "line 3: a value is missing"
+/// ```
+describe(problem: TomlError) -> String {
+  "line " + int.to_string(problem.line) + ": " + problem.message
+}
+
+// --- helpers ------------------------------------------------------------------
+
+/// The value under a key, if this is a table that has it.
+///
+/// ```pooka
+/// import tome
+///
+/// let assert Ok(config) = tome.parse("name = \"Ada\"")
+/// assert tome.get(config, "name") == Some(tome.TString("Ada"))
+/// assert tome.get(config, "wings") == None
+/// ```
+get(value: Toml, key: String) -> Option(Toml) {
+  match value {
+    TTable(entries) -> _lookup(entries, key)
+    _ -> None
+  }
+}
+
+/// Follow several keys, one table inside another.
+///
+/// ```pooka
+/// import tome
+///
+/// let assert Ok(config) = tome.parse("[owner]\nname = \"Ada\"")
+/// assert tome.path(config, ["owner", "name"]) == Some(tome.TString("Ada"))
+/// ```
+path(value: Toml, keys: List(String)) -> Option(Toml) {
+  match keys {
+    [] -> Some(value)
+    [key, ..rest] -> match get(value, key) {
+      Some(inner) -> path(inner, rest)
+      None -> None
+    }
+  }
+}
+
+/// The item at a position, counting from zero, if this is an array that has it.
+/// Negative and out-of-range positions return None.
+///
+/// ```pooka
+/// let assert Ok(config) = tome.parse("birds = ['owl', 'crow']")
+/// let assert Some(birds) = tome.get(config, "birds")
+/// assert tome.at(birds, 1) == Some(tome.TString("crow"))
+/// assert tome.at(birds, -1) == None
+/// ```
+at(value: Toml, index: Int) -> Option(Toml) {
+  match value {
+    TArray(items) -> list.at(items, index)
+    _ -> None
+  }
+}
+
+/// The text, if this is a string.
+///
+/// ```pooka
+/// assert tome.as_string(tome.TString("owl")) == Some("owl")
+/// assert tome.as_string(tome.TInt(2)) == None
+/// ```
+as_string(value: Toml) -> Option(String) {
+  match value {
+    TString(text) -> Some(text)
+    _ -> None
+  }
+}
+
+/// The number, if this is a whole number.
+///
+/// ```pooka
+/// assert tome.as_int(tome.TInt(42)) == Some(42)
+/// ```
+as_int(value: Toml) -> Option(Int) {
+  match value {
+    TInt(number) -> Some(number)
+    _ -> None
+  }
+}
+
+/// The number, if this is a float. Whole numbers are not floats in TOML.
+/// Infinity and NaN have their own value classes; they do not become BEAM floats.
+///
+/// ```pooka
+/// assert tome.as_float(tome.TFloat(1.5)) == Some(1.5)
+/// assert tome.as_float(tome.TInt(1)) == None
+/// ```
+as_float(value: Toml) -> Option(Float) {
+  match value {
+    TFloat(number) -> Some(number)
+    _ -> None
+  }
+}
+
+/// The truth value, if this is `true` or `false`.
+///
+/// ```pooka
+/// assert tome.as_bool(tome.TBool(True)) == Some(True)
+/// ```
+as_bool(value: Toml) -> Option(Bool) {
+  match value {
+    TBool(truth) -> Some(truth)
+    _ -> None
+  }
+}
+
+/// The text of a date, a time, or a date with a time. Fractional precision and
+/// offsets stay as written. A space between the date and time becomes T.
+///
+/// ```pooka
+/// assert tome.as_datetime(tome.TDate("2024-02-29")) == Some("2024-02-29")
+/// ```
+as_datetime(value: Toml) -> Option(String) {
+  match value {
+    TDateTime(text) -> Some(text)
+    TDate(text) -> Some(text)
+    TTime(text) -> Some(text)
+    _ -> None
+  }
+}
+
+/// The items, if this is an array.
+///
+/// ```pooka
+/// assert tome.as_list(tome.TArray([])) == Some([])
+/// ```
+as_list(value: Toml) -> Option(List(Toml)) {
+  match value {
+    TArray(items) -> Some(items)
+    _ -> None
+  }
+}
+
+/// The entries, if this is a table, in their source order.
+///
+/// ```pooka
+/// let assert Ok(config) = tome.parse("z = 1\na = 2")
+/// let assert Some(entries) = tome.as_entries(config)
+/// assert list.map(entries, fn(entry) { let #(key, _) = entry
+///   key
+/// }) == ["z", "a"]
+/// ```
+as_entries(value: Toml) -> Option(List(#(String, Toml))) {
+  match value {
+    TTable(entries) -> Some(entries)
+    _ -> None
+  }
+}
+
+_lookup(entries: List(#(String, Toml)), key: String) -> Option(Toml) {
+  match entries {
+    [] -> None
+    [#(name, value), ..rest] -> match name == key {
+      True -> Some(value)
+      False -> _lookup(rest, key)
+    }
+  }
+}
+
+// --- the document being built ---------------------------------------------------
+
+// A failed read: what went wrong, and the input that was left at that moment.
+// The line number is worked out from what is left, only when it is needed.
+class _Fail(message: String, rest: BitArray)
+
+// While reading, tables stay open so later lines can add to them. Entries and
+// array items are kept newest first, and turned around once at the end.
+class _Node {}
+
+// A finished value. Nothing can be added to it: not to an array written with
+// brackets, and not to an inline table.
+class _Leaf(value: Toml) is _Node
+
+// A table. `origin` remembers how it came to exist, because TOML has rules
+// about it: 0 for a table implied by a longer header such as `[a.b]`, 1 for a
+// table with its own header, and 2 for a table made by a dotted key.
+class _Table(entries: List(#(String, _Node)), origin: Int) is _Node
+
+// An array of tables, made by `[[name]]`. The newest table comes first.
+class _Tables(tables: List(_Node)) is _Node
+
+_leaf(value: Toml) -> _Node {
+  _Leaf(value)
+}
+
+_table(entries: List(#(String, _Node)), origin: Int) -> _Node {
+  _Table(entries, origin)
+}
+
+_tables(tables: List(_Node)) -> _Node {
+  _Tables(tables)
+}
+
+_freeze(node: _Node) -> Toml {
+  match node {
+    _Leaf(value) -> value
+    _Table(entries, _) -> _ttable(
+      list.map(list.reverse(entries), fn(entry: #(String, _Node)) {
+        let #(key, child) = entry
+        #(key, _freeze(child))
+      })
+    )
+    _Tables(tables) -> _tarray(list.map(list.reverse(tables), _freeze))
+  }
+}
+
+_ttable(entries: List(#(String, Toml))) -> Toml {
+  TTable(entries)
+}
+
+_tarray(items: List(Toml)) -> Toml {
+  TArray(items)
+}
+
+_find(entries: List(#(String, _Node)), key: String) -> Option(_Node) {
+  match entries {
+    [] -> None
+    [#(name, node), ..rest] -> match name == key {
+      True -> Some(node)
+      False -> _find(rest, key)
+    }
+  }
+}
+
+// Replace the node under a key, keeping its place in the order.
+_store(entries: List(#(String, _Node)), key: String, node: _Node) -> List(
+  #(String, _Node)
+) {
+  match _replace_entry(entries, key, node) {
+    Some(updated) -> updated
+    // Entries are newest first. A new header belongs at the front just like
+    // a new key, otherwise freezing the document reverses the header order.
+    None -> list.prepend(entries, #(key, node))
+  }
+}
+
+_replace_entry(entries: List(#(String, _Node)), key: String, node: _Node) -> Option(
+  List(#(String, _Node))
+) {
+  match entries {
+    [] -> None
+    [#(name, old), ..rest] -> match name == key {
+      True -> Some(list.prepend(rest, #(key, node)))
+      False -> match _replace_entry(rest, key, node) {
+        Some(updated) -> Some(list.prepend(updated, #(name, old)))
+        None -> None
+      }
+    }
+  }
+}
+
+// Set `a.b.c = value` inside one table. Dotted keys may only walk through
+// tables that dotted keys made.
+_put(node: _Node, keys: List(String), value: Toml) -> Result(_Node, String) {
+  match node {
+    _Table(entries, origin) -> match keys {
+      [] -> Error("a key is missing")
+      [key] -> match _find(entries, key) {
+        None -> Ok(_table(list.prepend(entries, #(key, _leaf(value))), origin))
+        Some(_) -> Error("the key `" + key + "` is defined twice")
+      }
+      [key, ..rest] -> match _find(entries, key) {
+        None -> {
+          let child = _put(_table([], 2), rest, value)?
+          Ok(_table(list.prepend(entries, #(key, child)), origin))
+        }
+        Some(_Table(inner, 2)) -> {
+          let child = _put(_table(inner, 2), rest, value)?
+          Ok(_table(_store(entries, key, child), origin))
+        }
+        Some(_) -> Error("the key `" + key + "` cannot be extended here")
+      }
+    }
+    _ -> Error("a value cannot be added here")
+  }
+}
+
+// Set a key in the table the last header opened. `here` is that header's path.
+_define(node: _Node, here: List(String), keys: List(String), value: Toml) -> Result(
+  _Node,
+  String
+) {
+  match here {
+    [] -> _put(node, keys, value)
+    [key, ..rest] -> match node {
+      _Table(entries, origin) -> match _find(entries, key) {
+        Some(_Tables([current, ..older])) -> {
+          let updated = _define(current, rest, keys, value)?
+          let array = _tables(list.prepend(older, updated))
+          Ok(_table(_store(entries, key, array), origin))
+        }
+        Some(child) -> {
+          let updated = _define(child, rest, keys, value)?
+          Ok(_table(_store(entries, key, updated), origin))
+        }
+        None -> Error("the current table has gone missing")
+      }
+      _ -> Error("a value cannot be added here")
+    }
+  }
+}
+
+// Open `[a.b.c]`, or add a table to `[[a.b.c]]`.
+_open(node: _Node, path: List(String), is_array: Bool) -> Result(_Node, String) {
+  match node {
+    _Table(entries, origin) -> match path {
+      [] -> Error("a table name is missing")
+      [key] -> {
+        let opened = _open_last(_find(entries, key), key, is_array)?
+        Ok(_table(_store(entries, key, opened), origin))
+      }
+      [key, ..rest] -> match _find(entries, key) {
+        None -> {
+          let child = _open(_table([], 0), rest, is_array)?
+          Ok(_table(_store(entries, key, child), origin))
+        }
+        Some(_Tables([current, ..older])) -> {
+          let updated = _open(current, rest, is_array)?
+          let array = _tables(list.prepend(older, updated))
+          Ok(_table(_store(entries, key, array), origin))
+        }
+        Some(_Leaf(_)) -> Error("`" + key + "` is not a table")
+        Some(child) -> {
+          let updated = _open(child, rest, is_array)?
+          Ok(_table(_store(entries, key, updated), origin))
+        }
+      }
+    }
+    _ -> Error("a table cannot be opened here")
+  }
+}
+
+_open_last(found: Option(_Node), key: String, is_array: Bool) -> Result(
+  _Node,
+  String
+) {
+  match is_array {
+    False -> match found {
+      None -> Ok(_table([], 1))
+      Some(_Table(inner, 0)) -> Ok(_table(inner, 1))
+      Some(_) -> Error("the table `" + key + "` is defined twice")
+    }
+    True -> match found {
+      None -> Ok(_tables([_table([], 1)]))
+      Some(_Tables(tables)) -> Ok(_tables(list.prepend(tables, _table([], 1))))
+      Some(_) -> Error("`" + key + "` is not an array of tables")
+    }
+  }
+}
+
+// --- lines ----------------------------------------------------------------------
+
+_fail(message: String, rest: BitArray) -> Result(a, _Fail) {
+  Error(_Fail(message, rest))
+}
+
+// Give a problem found while building the document its place in the text.
+_placed(result: Result(_Node, String), at: BitArray) -> Result(_Node, _Fail) {
+  match result {
+    Ok(node) -> Ok(node)
+    Error(message) -> Error(_Fail(message, at))
+  }
+}
+
+_newlines(input: BitArray, count: Int) -> Int {
+  match input {
+    <<10, rest:bits>> -> _newlines(rest, count + 1)
+    <<_:size(8), rest:bits>> -> _newlines(rest, count)
+    _ -> count
+  }
+}
+
+_document(input: BitArray, root: _Node, here: List(String)) -> Result(
+  _Node,
+  _Fail
+) {
+  let input = _skip_space(input)
+  match input {
+    <<>> -> Ok(root)
+    <<10, rest:bits>> -> _document(rest, root, here)
+    <<13, 10, rest:bits>> -> _document(rest, root, here)
+    <<35, rest:bits>> -> _document(_skip_comment(rest), root, here)
+    <<91, 91, rest:bits>> -> {
+      let #(path, rest) = _key_path(_skip_space(rest))?
+      match _skip_space(rest) {
+        <<93, 93, rest:bits>> -> {
+          let rest = _line_end(rest)?
+          let root = _placed(_open(root, path, True), input)?
+          _document(rest, root, path)
+        }
+        other -> _fail("a table array header must end with `]]`", other)
+      }
+    }
+    <<91, rest:bits>> -> {
+      let #(path, rest) = _key_path(_skip_space(rest))?
+      match _skip_space(rest) {
+        <<93, rest:bits>> -> {
+          let rest = _line_end(rest)?
+          let root = _placed(_open(root, path, False), input)?
+          _document(rest, root, path)
+        }
+        other -> _fail("a table header must end with `]`", other)
+      }
+    }
+    _ -> {
+      let #(keys, value, rest) = _pair(input)?
+      let rest = _line_end(rest)?
+      let root = _placed(_define(root, here, keys, value), input)?
+      _document(rest, root, here)
+    }
+  }
+}
+
+// `key = value`, also used inside inline tables.
+_pair(input: BitArray) -> Result(#(List(String), Toml, BitArray), _Fail) {
+  let #(keys, rest) = _key_path(input)?
+  match _skip_space(rest) {
+    <<61, rest:bits>> -> {
+      let #(value, rest) = _value(_skip_space(rest))?
+      Ok(#(keys, value, rest))
+    }
+    other -> _fail("a key must be followed by `=`", other)
+  }
+}
+
+_skip_space(input: BitArray) -> BitArray {
+  match input {
+    <<32, rest:bits>> -> _skip_space(rest)
+    <<9, rest:bits>> -> _skip_space(rest)
+    _ -> input
+  }
+}
+
+// Everything up to the end of the line. The newline itself is left behind.
+_skip_comment(input: BitArray) -> BitArray {
+  match input {
+    <<10, _:bits>> -> input
+    <<_:size(8), rest:bits>> -> _skip_comment(rest)
+    _ -> input
+  }
+}
+
+// Spaces, newlines and comments: the gaps allowed inside an array.
+_skip_blank(input: BitArray) -> BitArray {
+  match input {
+    <<32, rest:bits>> -> _skip_blank(rest)
+    <<9, rest:bits>> -> _skip_blank(rest)
+    <<10, rest:bits>> -> _skip_blank(rest)
+    <<13, 10, rest:bits>> -> _skip_blank(rest)
+    <<35, rest:bits>> -> _skip_blank(_skip_comment(rest))
+    _ -> input
+  }
+}
+
+// After a value or a header, only a comment may share the line.
+_line_end(input: BitArray) -> Result(BitArray, _Fail) {
+  match _skip_space(input) {
+    <<>> -> Ok(<<>>)
+    <<10, rest:bits>> -> Ok(rest)
+    <<13, 10, rest:bits>> -> Ok(rest)
+    <<35, rest:bits>> -> _line_end(_skip_comment(rest))
+    other -> _fail("only a comment may follow on the same line", other)
+  }
+}
+
+// --- keys -----------------------------------------------------------------------
+
+_key_path(input: BitArray) -> Result(#(List(String), BitArray), _Fail) {
+  let #(key, rest) = _key(input)?
+  _more_keys(rest, [key])
+}
+
+_more_keys(input: BitArray, keys: List(String)) -> Result(
+  #(List(String), BitArray),
+  _Fail
+) {
+  match _skip_space(input) {
+    <<46, rest:bits>> -> {
+      let #(key, rest) = _key(_skip_space(rest))?
+      _more_keys(rest, list.prepend(keys, key))
+    }
+    _ -> Ok(#(list.reverse(keys), input))
+  }
+}
+
+_key(input: BitArray) -> Result(#(String, BitArray), _Fail) {
+  match input {
+    <<34, rest:bits>> -> _basic(rest, <<>>)
+    <<39, rest:bits>> -> _literal(rest, <<>>)
+    _ -> {
+      let #(name, rest) = _bare(input, <<>>)
+      match name {
+        <<>> -> _fail("a key is missing", input)
+        _ -> _text(name, rest)
+      }
+    }
+  }
+}
+
+_bare(input: BitArray, name: BitArray) -> #(BitArray, BitArray) {
+  match input {
+    <<c:size(8), rest:bits>> if _is_bare(c) -> _bare(
+      rest,
+      <<name:bits, c:size(8)>>
+    )
+    _ -> #(name, input)
+  }
+}
+
+_is_bare(c: Int) -> Bool {
+  _is_digit(c) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 95 || c == 45
+}
+
+_is_digit(c: Int) -> Bool {
+  c >= 48 && c <= 57
+}
+
+// Tab is the only control character TOML allows inside a string or comment.
+_is_control(c: Int) -> Bool {
+  (
+    c < 32 && c != 9
+  ) || c == 127
+}
+
+_text(bytes: BitArray, rest: BitArray) -> Result(#(String, BitArray), _Fail) {
+  match bit_array.to_string(bytes) {
+    Ok(text) -> Ok(#(text, rest))
+    Error(_) -> _fail("a string is not valid UTF-8", rest)
+  }
+}
+
+// A comment is still part of the document. Check raw controls before reading
+// values, so a hidden byte cannot slip past inside a discarded comment.
+// Escaped controls are ASCII backslashes here; they are resolved later.
+_validate(input: BitArray) -> Result(Nil, _Fail) {
+  match input {
+    <<13, 10, rest:bits>> -> _validate(rest)
+    <<10, rest:bits>> -> _validate(rest)
+    <<c:size(8), _:bits>> if _is_control(c) -> _fail(
+      "a raw control character is not allowed in a document",
+      input
+    )
+    <<_:size(8), rest:bits>> -> _validate(rest)
+    _ -> Ok(Nil)
+  }
+}
+
+// --- strings --------------------------------------------------------------------
+
+// "basic", after the opening quote.
+_basic(input: BitArray, text: BitArray) -> Result(#(String, BitArray), _Fail) {
+  match input {
+    <<34, rest:bits>> -> _text(text, rest)
+    <<92, rest:bits>> -> {
+      let #(bytes, rest) = _escape(rest)?
+      _basic(rest, <<text:bits, bytes:bits>>)
+    }
+    <<c:size(8), _:bits>> if c == 10 || c == 13 -> _fail(
+      "a string must be closed on the line where it starts",
+      input
+    )
+    <<c:size(8), _:bits>> if _is_control(c) -> _fail(
+      "a control character must be written as an escape",
+      input
+    )
+    <<c:size(8), rest:bits>> -> _basic(rest, <<text:bits, c:size(8)>>)
+    _ -> _fail("a string is never closed", input)
+  }
+}
+
+// 'literal', after the opening quote. What you see is what you get.
+_literal(input: BitArray, text: BitArray) -> Result(#(String, BitArray), _Fail) {
+  match input {
+    <<39, rest:bits>> -> _text(text, rest)
+    <<c:size(8), _:bits>> if c == 10 || c == 13 -> _fail(
+      "a string must be closed on the line where it starts",
+      input
+    )
+    <<c:size(8), _:bits>> if _is_control(c) -> _fail(
+      "a literal string cannot hold a control character",
+      input
+    )
+    <<c:size(8), rest:bits>> -> _literal(rest, <<text:bits, c:size(8)>>)
+    _ -> _fail("a string is never closed", input)
+  }
+}
+
+// A newline straight after the opening quotes is not part of the string.
+_first_newline(input: BitArray) -> BitArray {
+  match input {
+    <<10, rest:bits>> -> rest
+    <<13, 10, rest:bits>> -> rest
+    _ -> input
+  }
+}
+
+// """multi-line basic""", after the opening quotes.
+_long_basic(input: BitArray, text: BitArray) -> Result(
+  #(String, BitArray),
+  _Fail
+) {
+  match input {
+    // One or two quotes may sit just inside the closing three.
+    <<34, 34, 34, 34, 34, rest:bits>> -> _text(<<text:bits, 34, 34>>, rest)
+    <<34, 34, 34, 34, rest:bits>> -> _text(<<text:bits, 34>>, rest)
+    <<34, 34, 34, rest:bits>> -> _text(text, rest)
+    <<92, rest:bits>> -> match _ends_line(rest) {
+      True -> _long_basic(_skip_gap(rest), text)
+      False -> {
+        let #(bytes, rest) = _escape(rest)?
+        _long_basic(rest, <<text:bits, bytes:bits>>)
+      }
+    }
+    <<10, rest:bits>> -> _long_basic(rest, <<text:bits, 10>>)
+    <<13, 10, rest:bits>> -> _long_basic(rest, <<text:bits, 13, 10>>)
+    <<c:size(8), _:bits>> if _is_control(c) -> _fail(
+      "a control character must be written as an escape",
+      input
+    )
+    <<c:size(8), rest:bits>> -> _long_basic(rest, <<text:bits, c:size(8)>>)
+    _ -> _fail("a multi-line string is never closed", input)
+  }
+}
+
+// '''multi-line literal''', after the opening quotes.
+_long_literal(input: BitArray, text: BitArray) -> Result(
+  #(String, BitArray),
+  _Fail
+) {
+  match input {
+    <<39, 39, 39, 39, 39, rest:bits>> -> _text(<<text:bits, 39, 39>>, rest)
+    <<39, 39, 39, 39, rest:bits>> -> _text(<<text:bits, 39>>, rest)
+    <<39, 39, 39, rest:bits>> -> _text(text, rest)
+    <<10, rest:bits>> -> _long_literal(rest, <<text:bits, 10>>)
+    <<13, 10, rest:bits>> -> _long_literal(rest, <<text:bits, 13, 10>>)
+    <<c:size(8), _:bits>> if _is_control(c) -> _fail(
+      "a literal string cannot hold a control character",
+      input
+    )
+    <<c:size(8), rest:bits>> -> _long_literal(rest, <<text:bits, c:size(8)>>)
+    _ -> _fail("a multi-line string is never closed", input)
+  }
+}
+
+// Is a backslash the last thing on its line, apart from spaces?
+_ends_line(input: BitArray) -> Bool {
+  match _skip_space(input) {
+    <<10, _:bits>> -> True
+    <<13, 10, _:bits>> -> True
+    _ -> False
+  }
+}
+
+// After a line-ending backslash, skip to the next thing that is not blank.
+_skip_gap(input: BitArray) -> BitArray {
+  match input {
+    <<32, rest:bits>> -> _skip_gap(rest)
+    <<9, rest:bits>> -> _skip_gap(rest)
+    <<10, rest:bits>> -> _skip_gap(rest)
+    <<13, 10, rest:bits>> -> _skip_gap(rest)
+    _ -> input
+  }
+}
+
+// The character after a backslash, as the bytes it stands for.
+_escape(input: BitArray) -> Result(#(BitArray, BitArray), _Fail) {
+  match input {
+    <<98, rest:bits>> -> Ok(#(<<8>>, rest))
+    <<116, rest:bits>> -> Ok(#(<<9>>, rest))
+    <<110, rest:bits>> -> Ok(#(<<10>>, rest))
+    <<102, rest:bits>> -> Ok(#(<<12>>, rest))
+    <<114, rest:bits>> -> Ok(#(<<13>>, rest))
+    <<34, rest:bits>> -> Ok(#(<<34>>, rest))
+    <<92, rest:bits>> -> Ok(#(<<92>>, rest))
+    <<117, digits:bytes-size(4), rest:bits>> -> _unicode(digits, rest, input)
+    <<85, digits:bytes-size(8), rest:bits>> -> _unicode(digits, rest, input)
+    _ -> _fail("this escape is not one TOML knows", input)
+  }
+}
+
+_unicode(digits: BitArray, rest: BitArray, at: BitArray) -> Result(
+  #(BitArray, BitArray),
+  _Fail
+) {
+  let scalar = match bit_array.to_string(digits) {
+    Ok(text) -> match _all(string.to_list(text), _is_hex) {
+      True -> int.parse_base(text, 16)
+      False -> int.parse_base("", 16)
+    }
+    Error(_) -> int.parse_base("", 16)
+  }
+  match scalar {
+    Ok(code) if code < 55296 || (code > 57343 && code <= 1114111) -> Ok(
+      #(_utf8(code), rest)
+    )
+    _ -> _fail("a unicode escape must name a real character", at)
+  }
+}
+
+// Spell a code point as UTF-8, by dealing its bits out between the bytes.
+_utf8(code: Int) -> BitArray {
+  match code {
+    _ if code < 128 -> <<code:size(8)>>
+    _ if code < 2048 -> {
+      let assert <<a:size(5), b:size(6)>> = <<code:size(11)>>
+      <<6:size(3), a:size(5), 2:size(2), b:size(6)>>
+    }
+    _ if code < 65536 -> {
+      let assert <<a:size(4), b:size(6), c:size(6)>> = <<code:size(16)>>
+      <<14:size(4), a:size(4), 2:size(2), b:size(6), 2:size(2), c:size(6)>>
+    }
+    _ -> {
+      let assert <<a:size(3), b:size(6), c:size(6), d:size(6)>> = <<
+        code: size(21)
+      >>
+      <<
+        30: size(5),
+        a: size(3),
+        2: size(2),
+        b: size(6),
+        2: size(2),
+        c: size(6),
+        2: size(2),
+        d: size(6)
+      >>
+    }
+  }
+}
+
+// --- values ---------------------------------------------------------------------
+
+_ok(value: Toml, rest: BitArray) -> Result(#(Toml, BitArray), _Fail) {
+  Ok(#(value, rest))
+}
+
+_string(read: Result(#(String, BitArray), _Fail)) -> Result(
+  #(Toml, BitArray),
+  _Fail
+) {
+  let #(text, rest) = read?
+  _ok(TString(text), rest)
+}
+
+_value(input: BitArray) -> Result(#(Toml, BitArray), _Fail) {
+  match input {
+    <<34, 34, 34, rest:bits>> -> _string(
+      _long_basic(_first_newline(rest), <<>>)
+    )
+    <<34, rest:bits>> -> _string(_basic(rest, <<>>))
+    <<39, 39, 39, rest:bits>> -> _string(
+      _long_literal(_first_newline(rest), <<>>)
+    )
+    <<39, rest:bits>> -> _string(_literal(rest, <<>>))
+    <<91, rest:bits>> -> _array(rest, [])
+    <<123, rest:bits>> -> _inline(rest)
+    _ -> {
+      let #(word, rest) = _word(input, <<>>)
+      let #(word, rest) = _with_time(word, rest)
+      match bit_array.to_string(word) {
+        Ok("") -> _fail("a value is missing", input)
+        Ok(text) -> match _scalar(text) {
+          Some(value) -> _ok(value, rest)
+          None -> _fail("`" + text + "` is not a value TOML knows", input)
+        }
+        Error(_) -> _fail("a value is not valid UTF-8", input)
+      }
+    }
+  }
+}
+
+// A bare value runs until something that cannot be part of one.
+_word(input: BitArray, word: BitArray) -> #(BitArray, BitArray) {
+  match input {
+    <<c:size(8), rest:bits>> if !_ends_word(c) -> _word(
+      rest,
+      <<word:bits, c:size(8)>>
+    )
+    _ -> #(word, input)
+  }
+}
+
+_ends_word(c: Int) -> Bool {
+  c == 32 || c == 9 || c == 10 || c == 13 || c == 44 || c == 93 || c == 125 || c == 35
+}
+
+// A date may be followed by a space and a time: `1979-05-27 07:32:00`.
+_with_time(word: BitArray, rest: BitArray) -> #(BitArray, BitArray) {
+  match #(bit_array.byte_size(word), rest) {
+    #(10, <<32, a:size(8), b:size(8), 58, _:bits>>) if _is_digit(a) && _is_digit(
+      b
+    ) -> {
+      let assert <<32, after:bits>> = rest
+      let #(time, rest) = _word(after, <<>>)
+      #(<<word:bits, 84, time:bits>>, rest)
+    }
+    _ -> #(word, rest)
+  }
+}
+
+_array(input: BitArray, items: List(Toml)) -> Result(#(Toml, BitArray), _Fail) {
+  match _skip_blank(input) {
+    <<93, rest:bits>> -> _ok(TArray(list.reverse(items)), rest)
+    start -> {
+      let #(item, rest) = _value(start)?
+      let items = list.prepend(items, item)
+      match _skip_blank(rest) {
+        <<44, rest:bits>> -> _array(rest, items)
+        <<93, rest:bits>> -> _ok(TArray(list.reverse(items)), rest)
+        other -> _fail("array items must be separated by `,`", other)
+      }
+    }
+  }
+}
+
+// { an = "inline", table = true }, after the opening brace.
+_inline(input: BitArray) -> Result(#(Toml, BitArray), _Fail) {
+  match _skip_space(input) {
+    <<125, rest:bits>> -> _ok(TTable([]), rest)
+    start -> _inline_pairs(start, _table([], 1))
+  }
+}
+
+_inline_pairs(input: BitArray, table: _Node) -> Result(#(Toml, BitArray), _Fail) {
+  let #(keys, value, rest) = _pair(input)?
+  let table = _placed(_put(table, keys, value), input)?
+  match _skip_space(rest) {
+    <<44, rest:bits>> -> _inline_pairs(_skip_space(rest), table)
+    <<125, rest:bits>> -> _ok(_freeze(table), rest)
+    other -> _fail(
+      "an inline table must close with `}` on the same line",
+      other
+    )
+  }
+}
+
+// --- bare values: booleans, numbers, dates ----------------------------------------
+
+_scalar(text: String) -> Option(Toml) {
+  match text {
+    "true" -> Some(TBool(True))
+    "false" -> Some(TBool(False))
+    "inf" -> Some(TInfinity(True))
+    "+inf" -> Some(TInfinity(True))
+    "-inf" -> Some(TInfinity(False))
+    "nan" -> Some(TNan())
+    "+nan" -> Some(TNan())
+    "-nan" -> Some(TNan())
+    _ -> {
+      let codes = string.to_list(text)
+      match #(_looks_dated(codes), _prefix(text)) {
+        #(True, _) -> _dated(text, codes)
+        #(False, "0x") -> _radix(text, 16, _is_hex)
+        #(False, "0o") -> _radix(text, 8, _is_octal)
+        #(False, "0b") -> _radix(text, 2, _is_binary)
+        _ -> match list.any(codes, _is_float_mark) {
+          True -> _float(text)
+          False -> _integer(text)
+        }
+      }
+    }
+  }
+}
+
+_prefix(text: String) -> String {
+  string.slice(text, 0, 2)
+}
+
+_is_hex(c: Int) -> Bool {
+  _is_digit(c) || (c >= 65 && c <= 70) || (c >= 97 && c <= 102)
+}
+
+_is_octal(c: Int) -> Bool {
+  c >= 48 && c <= 55
+}
+
+_is_binary(c: Int) -> Bool {
+  c == 48 || c == 49
+}
+
+// `.`, `e` or `E`: the marks that make a number a float.
+_is_float_mark(c: Int) -> Bool {
+  c == 46 || c == 101 || c == 69
+}
+
+_all(codes: List(Int), accept: fn(Int) -> Bool) -> Bool {
+  match codes {
+    [] -> True
+    [c, ..rest] -> accept(c) && _all(rest, accept)
+  }
+}
+
+// Digits, where an underscore may sit between two of them: `1_000`.
+_digits(text: String, accept: fn(Int) -> Bool) -> Bool {
+  match string.to_list(text) {
+    [] -> False
+    [first, ..rest] -> accept(first) && _digits_after(rest, accept)
+  }
+}
+
+_digits_after(codes: List(Int), accept: fn(Int) -> Bool) -> Bool {
+  match codes {
+    [] -> True
+    [95, next, ..rest] -> accept(next) && _digits_after(rest, accept)
+    [c, ..rest] -> accept(c) && _digits_after(rest, accept)
+  }
+}
+
+// Decimal digits with no leading zero, so `0` and `10` but not `01`.
+_plain(text: String) -> Bool {
+  _digits(text, _is_digit) && (text == "0" || !string.starts_with(text, "0"))
+}
+
+_clean(text: String) -> String {
+  string.replace(text, "_", "")
+}
+
+// A number's sign, and the number without it.
+_signed(text: String) -> #(String, String) {
+  let body = string.slice(text, 1, string.length(text))
+  match string.slice(text, 0, 1) {
+    "+" -> #("", body)
+    "-" -> #("-", body)
+    _ -> #("", text)
+  }
+}
+
+_integer(text: String) -> Option(Toml) {
+  let #(sign, body) = _signed(text)
+  match _plain(body) {
+    False -> None
+    True -> match int.parse(sign + _clean(body)) {
+      Ok(number) -> Some(TInt(number))
+      Error(_) -> None
+    }
+  }
+}
+
+_radix(text: String, base: Int, accept: fn(Int) -> Bool) -> Option(Toml) {
+  let body = string.slice(text, 2, string.length(text))
+  match _digits(body, accept) {
+    False -> None
+    True -> match int.parse_base(_clean(body), base) {
+      Ok(number) -> Some(TInt(number))
+      Error(_) -> None
+    }
+  }
+}
+
+_float(text: String) -> Option(Toml) {
+  let #(sign, body) = _signed(text)
+  let #(mantissa, exponent) = match string.split(string.lowercase(body), "e") {
+    [mantissa] -> #(mantissa, Some(""))
+    [mantissa, exponent] -> #(mantissa, _exponent(exponent))
+    _ -> #("", None)
+  }
+  let parts = match string.split(mantissa, ".") {
+    [whole] -> Some(#(whole, "0"))
+    [whole, fraction] if _digits(fraction, _is_digit) -> Some(
+      #(whole, fraction)
+    )
+    _ -> None
+  }
+  match #(parts, exponent) {
+    #(Some(#(whole, fraction)), Some(power)) if _plain(whole) -> match float.parse(
+      sign + _clean(whole) + "." + _clean(fraction) + power
+    ) {
+      Ok(number) -> Some(TFloat(number))
+      Error(_) -> None
+    }
+    _ -> None
+  }
+}
+
+// The part after `e`, checked and ready to be put back: `e+10`.
+_exponent(text: String) -> Option(String) {
+  let #(sign, digits) = _signed(text)
+  match _digits(digits, _is_digit) {
+    True -> Some("e" + sign + _clean(digits))
+    False -> None
+  }
+}
+
+// --- dates and times ------------------------------------------------------------
+
+// A date starts with four digits and a dash; a time has a colon in third place.
+_looks_dated(codes: List(Int)) -> Bool {
+  match codes {
+    [a, b, c, d, 45, ..] -> _all([a, b, c, d], _is_digit)
+    [a, b, 58, ..] -> _all([a, b], _is_digit)
+    _ -> False
+  }
+}
+
+_dated(text: String, codes: List(Int)) -> Option(Toml) {
+  match codes {
+    [_, _, 58, ..] -> match _time(codes) {
+      Some([]) -> Some(TTime(text))
+      _ -> None
+    }
+    _ -> match _date(codes) {
+      Some([]) -> Some(TDate(text))
+      Some([mark, ..rest]) if mark == 84 || mark == 116 -> match _time(rest) {
+        Some(after) -> match _offset(after) {
+          True -> Some(TDateTime(text))
+          False -> None
+        }
+        None -> None
+      }
+      _ -> None
+    }
+  }
+}
+
+_two(a: Int, b: Int) -> Int {
+  (
+    a - 48
+  ) * 10 + b - 48
+}
+
+// YYYY-MM-DD, returning what follows it.
+_date(codes: List(Int)) -> Option(List(Int)) {
+  match codes {
+    [y1, y2, y3, y4, 45, m1, m2, 45, d1, d2, ..rest] if _all(
+      [y1, y2, y3, y4, m1, m2, d1, d2],
+      _is_digit
+    ) -> {
+      let year = _two(y1, y2) * 100 + _two(y3, y4)
+      let month = _two(m1, m2)
+      let day = _two(d1, d2)
+      match month >= 1 && month <= 12 && day >= 1 && day <= _month_days(
+        year,
+        month
+      ) {
+        True -> Some(rest)
+        False -> None
+      }
+    }
+    _ -> None
+  }
+}
+
+_month_days(year: Int, month: Int) -> Int {
+  match month {
+    2 -> match _is_leap(year) {
+      True -> 29
+      False -> 28
+    }
+    4 -> 30
+    6 -> 30
+    9 -> 30
+    11 -> 30
+    _ -> 31
+  }
+}
+
+_is_leap(year: Int) -> Bool {
+  let by = fn(n: Int) { int.remainder(year, n) == Ok(0) }
+  by(4) && (!by(100) || by(400))
+}
+
+// HH:MM:SS with an optional fraction, returning what follows it.
+_time(codes: List(Int)) -> Option(List(Int)) {
+  match codes {
+    [h1, h2, 58, m1, m2, 58, s1, s2, ..rest] if _all(
+      [h1, h2, m1, m2, s1, s2],
+      _is_digit
+    ) -> match _two(h1, h2) <= 23 && _two(m1, m2) <= 59 && _two(s1, s2) <= 60 {
+      True -> _fraction(rest)
+      False -> None
+    }
+    _ -> None
+  }
+}
+
+_fraction(codes: List(Int)) -> Option(List(Int)) {
+  match codes {
+    [46, digit, ..rest] if _is_digit(digit) -> Some(_drop_digits(rest))
+    [46, ..] -> None
+    _ -> Some(codes)
+  }
+}
+
+_drop_digits(codes: List(Int)) -> List(Int) {
+  match codes {
+    [c, ..rest] if _is_digit(c) -> _drop_digits(rest)
+    _ -> codes
+  }
+}
+
+// Nothing, `Z`, or `+HH:MM`.
+_offset(codes: List(Int)) -> Bool {
+  match codes {
+    [] -> True
+    [90] -> True
+    [122] -> True
+    [sign, h1, h2, 58, m1, m2] if (sign == 43 || sign == 45) && _all(
+      [h1, h2, m1, m2],
+      _is_digit
+    ) -> _two(h1, h2) <= 23 && _two(m1, m2) <= 59
+    _ -> False
+  }
+}

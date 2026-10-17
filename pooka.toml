@@ -1,0 +1,17 @@
+name = "tome"
+version = "1.0.0"
+description = "A TOML 1.0 parser for Pooka"
+licences = ["Apache-2.0"]
+authors = ["Peregrine Finch"]
+repository = { type = "github", user = "peregrinefinch", repo = "tome" }
+links = [{ title = "Pooka", href = "https://pooka.run" }]
+
+[dependencies]
+pooka_stdlib = ">= 0.3.0 and < 1.0.0"
+
+[dev-dependencies]
+
+[[documentation.pages]]
+title = "Reading configuration"
+path = "guide.html"
+source = "docs/guide.md"
