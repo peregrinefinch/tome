@@ -1,0 +1,224 @@
+// SPDX-License-Identifier: Apache-2.0
+
+//// The public door deserves a few tests of its own. The corpus checks grammar;
+//// these examples check the promises a caller sees, including table order and
+//// the line printed when a document has gone astray.
+module tome_test
+
+import tome.{Toml, TString, TInt, TBool, TArray, TTable}
+import pooka/list
+
+_parse(text: String) -> tome.Toml {
+  let assert Ok(document) = tome.parse(text)
+  document
+}
+
+_error(text: String) -> tome.TomlError {
+  let assert Error(problem) = tome.parse(text)
+  problem
+}
+
+test "an empty document is an empty table" {
+  assert _parse("") == _expected_table([])
+  assert _parse(" \t\r\n# a quiet page\n") == _expected_table([])
+}
+
+test "typed scalar helpers keep their own kinds" {
+  let config = _parse("name = 'owl'\ncount = 12\nratio = 1.5\nawake = true")
+  let assert Some(name) = tome.get(config, "name")
+  let assert Some(count) = tome.get(config, "count")
+  let assert Some(ratio) = tome.get(config, "ratio")
+  let assert Some(awake) = tome.get(config, "awake")
+  assert tome.as_string(name) == Some("owl")
+  assert tome.as_int(count) == Some(12)
+  assert tome.as_float(ratio) == Some(1.5)
+  assert tome.as_bool(awake) == Some(True)
+  assert tome.as_float(count) == None
+  assert tome.as_int(ratio) == None
+  assert tome.as_bool(name) == None
+  assert tome.as_string(count) == None
+}
+
+test "accessors return None for other shapes" {
+  let text = _expected_text("owl")
+  assert tome.get(text, "name") == None
+  assert tome.at(text, 0) == None
+  assert tome.as_list(text) == None
+  assert tome.as_entries(text) == None
+  assert tome.as_datetime(text) == None
+  assert tome.get(_parse("a = 1"), "missing") == None
+}
+
+test "paths walk tables and an empty path keeps its value" {
+  let config = _parse("[owner.contact]\nname = 'Ada'")
+  assert tome.path(config, []) == Some(config)
+  assert tome.path(config, ["owner", "contact", "name"]) == Some(
+    _expected_text("Ada")
+  )
+  assert tome.path(config, ["owner", "missing"]) == None
+  assert tome.path(config, ["owner", "contact", "name", "x"]) == None
+}
+
+test "array lookup is zero based and never wraps" {
+  let config = _parse("items = [1, 'owl', true]")
+  let assert Some(items) = tome.get(config, "items")
+  assert tome.at(items, 0) == Some(_expected_integer(1))
+  assert tome.at(items, 1) == Some(_expected_text("owl"))
+  assert tome.at(items, -1) == None
+  assert tome.at(items, 3) == None
+  assert tome.as_list(items) == Some(
+    [_expected_integer(1), _expected_text("owl"), _expected_boolean(True)]
+  )
+  assert tome.at(_expected_array([]), 0) == None
+}
+
+test "root table entries retain source order" {
+  assert tome.as_entries(_parse("z = 1\na = 2\nm = 3")) == Some(
+    [
+      #("z", _expected_integer(1)),
+      #("a", _expected_integer(2)),
+      #("m", _expected_integer(3))
+    ]
+  )
+}
+
+test "opening an implicit parent does not move its place" {
+  let config = _parse("[z.child]\nx = 1\n[a]\ny = 2\n[z]\nname = 'owl'")
+  let assert Some(entries) = tome.as_entries(config)
+  assert list.map(entries, fn(entry) {
+    let #(key, _) = entry
+    key
+  }) == ["z", "a"]
+  let assert Some(parent) = tome.get(config, "z")
+  let assert Some(fields) = tome.as_entries(parent)
+  assert list.map(fields, fn(entry) {
+    let #(key, _) = entry
+    key
+  }) == ["child", "name"]
+}
+
+test "dotted keys join their first table without moving it" {
+  let config = _parse("bird.name = 'owl'\nmoon = true\nbird.wings = 2")
+  assert tome.as_entries(config) == Some([
+    #(
+      "bird",
+      _expected_table(
+        [#("name", _expected_text("owl")), #("wings", _expected_integer(2))]
+      )
+    ),
+    #("moon", _expected_boolean(True))
+  ])
+}
+
+test "table arrays attach children to the latest item" {
+  let config = _parse(
+    "[[birds]]\nname = 'owl'\n[birds.home]\ntree = 'oak'\n[[birds]]\nname = 'crow'\n[birds.home]\ntree = 'pine'"
+  )
+  let assert Some(birds) = tome.get(config, "birds")
+  let assert Some(owl) = tome.at(birds, 0)
+  let assert Some(crow) = tome.at(birds, 1)
+  assert tome.path(owl, ["home", "tree"]) == Some(_expected_text("oak"))
+  assert tome.path(crow, ["home", "tree"]) == Some(_expected_text("pine"))
+}
+
+test "inline tables are closed to later additions" {
+  assert _error("bird = { name = 'owl' }\nbird.wings = 2").line == 2
+  assert _error("bird = { name = 'owl' }\n[bird]").line == 2
+  assert _error("bird = [{ name = 'owl' }]\n[[bird]]").line == 2
+}
+
+test "duplicate table and key errors point to the later definition" {
+  let duplicate = _error("name = 1\n# a pause\nname = 2")
+  assert duplicate.line == 3
+  assert duplicate.message == "the key `name` is defined twice"
+  assert tome.describe(duplicate) == "line 3: the key `name` is defined twice"
+  assert _error("[bird]\n[bird]").line == 2
+  assert _error("a.b = 1\n[a]").line == 2
+}
+
+test "line counting follows LF and CRLF through multiline values" {
+  assert _error("# first\n\nanswer = ").line == 3
+  assert _error("# first\r\n\r\nanswer = ").line == 3
+  assert _error("story = '''\none\ntwo'''\nanswer = ").line == 4
+}
+
+test "raw controls in comments are rejected with their line" {
+  let bad = "name = 'owl'\n# hidden " + "\u{0}"
+  assert _error(bad).line == 2
+  assert _error("# lone carriage return\r").line == 1
+  assert _error("# delete \u{7f}").line == 1
+  assert _parse("# a tab\t is allowed\nname = 'owl'") == _expected_table(
+    [#("name", _expected_text("owl"))]
+  )
+}
+
+test "escaped controls are values rather than raw document controls" {
+  let config = _parse("text = \"\\u0000\\b\\f\\n\\r\\t\"")
+  assert tome.get(config, "text") == Some(
+    _expected_text("\u{0}\u{8}\u{c}\n\r\t")
+  )
+}
+
+test "unicode escapes reach both ends of the scalar range" {
+  let config = _parse(
+    "text = \"\\u007F\\u0080\\u07FF\\u0800\\uD7FF\\uE000\\U00010000\\U0010FFFF\""
+  )
+  assert tome.get(config, "text") == Some(
+    _expected_text(
+      "\u{7f}\u{80}\u{7ff}\u{800}\u{d7ff}\u{e000}\u{10000}\u{10ffff}"
+    )
+  )
+  let assert Error(_) = tome.parse("text = \"\\uD800\"")
+  let assert Error(_) = tome.parse("text = \"\\U00110000\"")
+}
+
+test "byte parsing validates the whole document including comments" {
+  assert tome.parse_bytes(<<110, 32, 61, 32, 49>>) == tome.parse("n = 1")
+  let assert Error(problem) = tome.parse_bytes(<<35, 32, 255>>)
+  assert problem.message == "a document must be valid UTF-8"
+  let assert Error(_) = tome.parse_bytes(<<192, 128>>)
+  let assert Error(_) = tome.parse_bytes(<<237, 160, 128>>)
+  let assert Error(_) = tome.parse_bytes(<<1:size(1)>>)
+}
+
+test "date accessors retain spelling and fractional precision" {
+  let config = _parse(
+    "day = 2024-02-29\nclock = 07:32:00.123456789\nmeeting = 2024-02-29 07:32:00.123456789+02:30"
+  )
+  let assert Some(day) = tome.get(config, "day")
+  let assert Some(clock) = tome.get(config, "clock")
+  let assert Some(meeting) = tome.get(config, "meeting")
+  assert tome.as_datetime(day) == Some("2024-02-29")
+  assert tome.as_datetime(clock) == Some("07:32:00.123456789")
+  assert tome.as_datetime(meeting) == Some(
+    "2024-02-29T07:32:00.123456789+02:30"
+  )
+}
+
+test "parses do not share mutable document state" {
+  let first = _parse("bird.name = 'owl'")
+  let second = _parse("bird.name = 'crow'")
+  assert tome.path(first, ["bird", "name"]) == Some(_expected_text("owl"))
+  assert tome.path(second, ["bird", "name"]) == Some(_expected_text("crow"))
+  assert _parse("") == _expected_table([])
+}
+
+_expected_text(value: String) -> Toml {
+  TString(value)
+}
+
+_expected_integer(value: Int) -> Toml {
+  TInt(value)
+}
+
+_expected_boolean(value: Bool) -> Toml {
+  TBool(value)
+}
+
+_expected_array(values: List(Toml)) -> Toml {
+  TArray(values)
+}
+
+_expected_table(values: List(#(String, Toml))) -> Toml {
+  TTable(values)
+}
