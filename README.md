@@ -19,7 +19,7 @@ assert tome.get(config, "answer") == Some(tome.TInt(42))
 
 Tables retain their written order. Parse failures include a line number. The TOML 1.0 conformance fixtures retain their upstream MIT licence in `test/fixtures/toml/`.
 
-See the [API documentation](https://tome.hexdocs.pm/) for the rest. Built for [Pooka](https://pooka.run) and Erlang/OTP 29.
+See the [API documentation](https://tome.hexdocs.pm/) for the rest.
 
 ## Licence
 
