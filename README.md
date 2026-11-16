@@ -11,10 +11,14 @@ pooka add tome
 ```
 
 ```pooka
+module main
+
 import tome
 
-let assert Ok(config) = tome.parse("answer = 42")
-assert tome.get(config, "answer") == Some(tome.TInt(42))
+main() {
+  let assert Ok(config) = tome.parse("answer = 42")
+  assert tome.get(config, "answer") == Some(tome.TInt(42))
+}
 ```
 
 Tables retain their written order. Parse failures include a line number. The TOML 1.0 conformance fixtures retain their upstream MIT licence in `test/fixtures/toml/`.
